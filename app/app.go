@@ -1,9 +1,11 @@
 package app
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"sort"
 	"strings"
@@ -13,6 +15,8 @@ import (
 
 	"github.com/iawia002/lux/downloader"
 	"github.com/iawia002/lux/extractors"
+	"github.com/iawia002/lux/logger"
+	"github.com/iawia002/lux/metrics"
 	"github.com/iawia002/lux/request"
 	"github.com/iawia002/lux/utils"
 )
@@ -30,8 +34,8 @@ func init() {
 		fmt.Fprintf(
 			color.Output,
 			"\n%s: version %s, A fast and simple video downloader.\n\n",
-			cyan.Sprintf(Name),
-			blue.Sprintf(c.App.Version),
+			cyan.Sprintf("%s", Name),
+			blue.Sprintf("%s", c.App.Version),
 		)
 	}
 }
@@ -47,6 +51,11 @@ func New() *cli.App {
 				Name:    "debug",
 				Aliases: []string{"d"},
 				Usage:   "Debug mode",
+			},
+			&cli.UintFlag{
+				Name:  "metrics-port",
+				Value: 0,
+				Usage: "Expose Prometheus metrics on the given port (0 means disabled)",
 			},
 			&cli.BoolFlag{
 				Name:    "silent",
@@ -211,6 +220,11 @@ func New() *cli.App {
 		Action: func(c *cli.Context) error {
 			args := c.Args().Slice()
 
+			logger.Init(c.Bool("debug"))
+			if port := c.Uint("metrics-port"); port > 0 {
+				metrics.StartServer(int(port))
+			}
+
 			if c.Bool("debug") {
 				cli.VersionPrinter(c)
 			}
@@ -254,13 +268,26 @@ func New() *cli.App {
 
 			var isErr bool
 			for _, videoURL := range args {
+				// Graceful shutdown: stop accepting new tasks once the
+				// shutdown signal has been received, and wait for the
+				// in-flight task to finish.
+				if c.Context != nil && c.Context.Err() != nil {
+					slog.Warn("shutdown in progress, stop accepting new tasks",
+						slog.String("remaining_url", videoURL),
+					)
+					break
+				}
 				if err := download(c, videoURL); err != nil {
 					fmt.Fprintf(
 						color.Output,
 						"Downloading %s error:\n",
 						color.CyanString("%s", videoURL),
 					)
-					fmt.Printf("%+v\n", err)
+					fmt.Fprintf(color.Output, "%s\n", color.RedString("%+v", err))
+					slog.Error("download task failed",
+						slog.String("url", videoURL),
+						slog.String("error", err.Error()),
+					)
 					isErr = true
 				}
 			}
@@ -277,6 +304,15 @@ func New() *cli.App {
 }
 
 func download(c *cli.Context, videoURL string) error {
+	// Generate a unique request_id for this task and propagate it through
+	// the whole chain (extract -> download -> HTTP requests).
+	// Note: the task context is intentionally detached from the shutdown
+	// context so that in-flight downloads are not cancelled by a signal
+	// and can finish gracefully.
+	ctx := logger.WithRequestID(context.Background(), logger.NewRequestID())
+	log := logger.FromContext(ctx)
+	log.InfoContext(ctx, "download task started", slog.String("url", videoURL))
+
 	data, err := extractors.Extract(videoURL, extractors.Options{
 		Playlist:         c.Bool("playlist"),
 		Items:            c.String("items"),
@@ -307,6 +343,7 @@ func download(c *cli.Context, videoURL string) error {
 	}
 
 	defaultDownloader := downloader.New(downloader.Options{
+		Context:        ctx,
 		Silent:         c.Bool("silent"),
 		InfoOnly:       c.Bool("info"),
 		Stream:         c.String("stream-format"),
@@ -341,5 +378,6 @@ func download(c *cli.Context, videoURL string) error {
 	if len(errors) != 0 {
 		return errors[0]
 	}
+	log.InfoContext(ctx, "download task finished", slog.String("url", videoURL))
 	return nil
 }

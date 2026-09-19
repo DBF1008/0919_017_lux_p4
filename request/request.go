@@ -3,9 +3,11 @@ package request
 import (
 	"compress/flate"
 	"compress/gzip"
+	"context"
 	"crypto/tls"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/cookiejar"
 	"strconv"
@@ -18,6 +20,8 @@ import (
 	"github.com/pkg/errors"
 
 	"github.com/iawia002/lux/config"
+	"github.com/iawia002/lux/logger"
+	"github.com/iawia002/lux/metrics"
 )
 
 var (
@@ -49,6 +53,20 @@ func SetOptions(opt Options) {
 
 // Request base request
 func Request(method, url string, body io.Reader, headers map[string]string) (*http.Response, error) {
+	return RequestWithContext(context.Background(), method, url, body, headers)
+}
+
+// RequestWithContext is the base request. A unique request_id is generated
+// for every HTTP request (or taken from the context when present) and is
+// propagated through structured logs and the X-Request-ID header.
+func RequestWithContext(ctx context.Context, method, url string, body io.Reader, headers map[string]string) (*http.Response, error) {
+	requestID := logger.RequestIDFrom(ctx)
+	if requestID == "" {
+		requestID = logger.NewRequestID()
+		ctx = logger.WithRequestID(ctx, requestID)
+	}
+	log := logger.FromContext(ctx)
+
 	transport := &http.Transport{
 		Proxy:               http.ProxyFromEnvironment,
 		DisableCompression:  true,
@@ -65,7 +83,7 @@ func Request(method, url string, body io.Reader, headers map[string]string) (*ht
 		Jar:       jar,
 	}
 
-	req, err := http.NewRequest(method, url, body)
+	req, err := http.NewRequestWithContext(ctx, method, url, body)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
@@ -78,6 +96,7 @@ func Request(method, url string, body io.Reader, headers map[string]string) (*ht
 	if _, ok := headers["Referer"]; !ok {
 		req.Header.Set("Referer", url)
 	}
+	req.Header.Set("X-Request-ID", requestID)
 	if rawCookie != "" {
 		// parse cookies in Netscape HTTP cookie format
 		cookies, _ := cookiemonster.ParseString(rawCookie)
@@ -100,6 +119,11 @@ func Request(method, url string, body io.Reader, headers map[string]string) (*ht
 		req.Header.Set("Referer", refer)
 	}
 
+	log.DebugContext(ctx, "http request started",
+		slog.String("method", method),
+		slog.String("url", url),
+	)
+
 	var (
 		res          *http.Response
 		requestError error
@@ -115,20 +139,49 @@ func Request(method, url string, body io.Reader, headers map[string]string) (*ht
 			} else {
 				err = errors.Errorf("%s request error: HTTP %d", url, res.StatusCode)
 			}
+			log.ErrorContext(ctx, "http request failed",
+				slog.String("method", method),
+				slog.String("url", url),
+				slog.Int("attempts", i+1),
+				slog.String("error", err.Error()),
+			)
 			return nil, errors.WithStack(err)
+		}
+		metrics.RetriesTotal.Inc()
+		if requestError != nil {
+			log.WarnContext(ctx, "http request error, retrying",
+				slog.String("method", method),
+				slog.String("url", url),
+				slog.Int("attempt", i+1),
+				slog.String("error", requestError.Error()),
+			)
+		} else {
+			log.WarnContext(ctx, "http request got bad status, retrying",
+				slog.String("method", method),
+				slog.String("url", url),
+				slog.Int("attempt", i+1),
+				slog.Int("status_code", res.StatusCode),
+			)
 		}
 		time.Sleep(1 * time.Second)
 	}
+	log.DebugContext(ctx, "http request finished",
+		slog.String("method", method),
+		slog.String("url", url),
+		slog.Int("status_code", res.StatusCode),
+	)
 	if debug {
 		blue := color.New(color.FgBlue)
-		fmt.Println()
-		blue.Printf("URL:         ") // nolint
-		fmt.Printf("%s\n", url)
-		blue.Printf("Method:      ") // nolint
-		fmt.Printf("%s\n", method)
-		blue.Printf("Headers:     ")        // nolint
-		pretty.Printf("%# v\n", req.Header) // nolint
-		blue.Printf("Status Code: ")        // nolint
+		fmt.Fprintln(color.Output)
+		blue.Fprintf(color.Output, "URL:         ")  // nolint
+		fmt.Fprintf(color.Output, "%s\n", url)       // nolint
+		blue.Fprintf(color.Output, "Request ID:  ")  // nolint
+		fmt.Fprintf(color.Output, "%s\n", requestID) // nolint
+		blue.Fprintf(color.Output, "Method:      ")  // nolint
+		fmt.Fprintf(color.Output, "%s\n", method)    // nolint
+		blue.Fprintf(color.Output, "Headers:     ")  // nolint
+		pretty.Printf("%# v\n", req.Header)          // nolint
+		blue.Fprintf(color.Output, "Status Code: ")  // nolint
 		if res.StatusCode >= 400 {
 			color.Red("%d", res.StatusCode)
 		} else {

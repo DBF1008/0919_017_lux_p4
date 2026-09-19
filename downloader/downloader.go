@@ -2,10 +2,12 @@ package downloader
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"path"
@@ -20,6 +22,8 @@ import (
 	"github.com/pkg/errors"
 
 	"github.com/iawia002/lux/extractors"
+	"github.com/iawia002/lux/logger"
+	"github.com/iawia002/lux/metrics"
 	"github.com/iawia002/lux/request"
 	"github.com/iawia002/lux/utils"
 )
@@ -46,12 +50,27 @@ type Options struct {
 	Aria2Token  string
 	Aria2Method string
 	Aria2Addr   string
+
+	// Context carries the request_id through the whole download chain.
+	// If nil, context.Background() is used.
+	Context context.Context
 }
 
 // Downloader is the default downloader.
 type Downloader struct {
 	Bar    *pb.ProgressBar
 	option Options
+}
+
+func (downloader *Downloader) ctx() context.Context {
+	if downloader.option.Context != nil {
+		return downloader.option.Context
+	}
+	return context.Background()
+}
+
+func (downloader *Downloader) log() *slog.Logger {
+	return logger.FromContext(downloader.ctx())
 }
 
 const (
@@ -109,7 +128,7 @@ func (downloader *Downloader) caption(url, fileName, ext string, transform func(
 }
 
 func (downloader *Downloader) writeFile(url string, file *os.File, headers map[string]string) (int64, error) {
-	res, err := request.Request(http.MethodGet, url, nil, headers)
+	res, err := request.RequestWithContext(downloader.ctx(), http.MethodGet, url, nil, headers)
 	if err != nil {
 		return 0, err
 	}
@@ -122,6 +141,7 @@ func (downloader *Downloader) writeFile(url string, file *os.File, headers map[s
 	if copyErr != nil && copyErr != io.EOF {
 		return written, errors.Errorf("file copy error: %s", copyErr)
 	}
+	metrics.DownloadBytesTotal.Add(float64(written))
 	return written, nil
 }
 
@@ -197,8 +217,19 @@ func (downloader *Downloader) save(part *extractors.Part, refer, fileName string
 				if err == nil {
 					break
 				} else if i+1 >= downloader.option.RetryTimes {
+					downloader.log().ErrorContext(downloader.ctx(), "chunk download failed, giving up",
+						slog.String("url", part.URL),
+						slog.Int("attempts", i+1),
+						slog.String("error", err.Error()),
+					)
 					return err
 				}
+				metrics.RetriesTotal.Inc()
+				downloader.log().WarnContext(downloader.ctx(), "chunk download failed, retrying",
+					slog.String("url", part.URL),
+					slog.Int("attempt", i+1),
+					slog.String("error", err.Error()),
+				)
 				temp += written
 				headers["Range"] = fmt.Sprintf("bytes=%d-%d", temp, end)
 				time.Sleep(1 * time.Second)
@@ -212,8 +243,19 @@ func (downloader *Downloader) save(part *extractors.Part, refer, fileName string
 			if err == nil {
 				break
 			} else if i+1 >= downloader.option.RetryTimes {
+				downloader.log().ErrorContext(downloader.ctx(), "file download failed, giving up",
+					slog.String("url", part.URL),
+					slog.Int("attempts", i+1),
+					slog.String("error", err.Error()),
+				)
 				return err
 			}
+			metrics.RetriesTotal.Inc()
+			downloader.log().WarnContext(downloader.ctx(), "file download failed, retrying",
+				slog.String("url", part.URL),
+				slog.Int("attempt", i+1),
+				slog.String("error", err.Error()),
+			)
 			temp += written
 			headers["Range"] = fmt.Sprintf("bytes=%d-", temp)
 			time.Sleep(1 * time.Second)
@@ -385,11 +427,22 @@ func (downloader *Downloader) multiThreadSave(dataPart *extractors.Part, refer, 
 						remainingSize -= chunkSize
 						break
 					} else if i+1 >= downloader.option.RetryTimes {
+						downloader.log().ErrorContext(downloader.ctx(), "multi-thread chunk download failed, giving up",
+							slog.String("url", dataPart.URL),
+							slog.Int("attempts", i+1),
+							slog.String("error", err.Error()),
+						)
 						mu.Lock()
 						errs = append(errs, err)
 						mu.Unlock()
 						return
 					}
+					metrics.RetriesTotal.Inc()
+					downloader.log().WarnContext(downloader.ctx(), "multi-thread chunk download failed, retrying",
+						slog.String("url", dataPart.URL),
+						slog.Int("attempt", i+1),
+						slog.String("error", err.Error()),
+					)
 					temp += written
 					headers["Range"] = fmt.Sprintf("bytes=%d-%d", temp, end)
 				}
@@ -549,7 +602,30 @@ func (downloader *Downloader) aria2(title string, stream *extractors.Stream) err
 }
 
 // Download download urls
-func (downloader *Downloader) Download(data *extractors.Data) error {
+func (downloader *Downloader) Download(data *extractors.Data) (downloadErr error) {
+	startTime := time.Now()
+	log := downloader.log()
+	var downloadedSize int64
+	log.InfoContext(downloader.ctx(), "download started",
+		slog.String("title", data.Title),
+		slog.String("site", data.Site),
+		slog.String("url", data.URL),
+	)
+	defer func() {
+		metrics.RecordDownload(downloadedSize, time.Since(startTime), downloadErr)
+		if downloadErr != nil {
+			log.ErrorContext(downloader.ctx(), "download failed",
+				slog.String("title", data.Title),
+				slog.Duration("duration", time.Since(startTime)),
+				slog.String("error", downloadErr.Error()),
+			)
+		} else {
+			log.InfoContext(downloader.ctx(), "download finished",
+				slog.String("title", data.Title),
+				slog.Duration("duration", time.Since(startTime)),
+			)
+		}
+	}()
 	if len(data.Streams) == 0 {
 		return errors.Errorf("no streams in title %s", data.Title)
 	}
@@ -605,16 +681,19 @@ func (downloader *Downloader) Download(data *extractors.Data) error {
 	if !downloader.option.Silent {
 		printStreamInfo(data, stream)
 	}
+	downloadedSize = stream.Size
 
 	// download caption
 	var subtitlePaths []string
 	var subtitleLangs []string
 	var subtitleFilesToDelete []string
 	if downloader.option.Caption && data.Captions != nil {
-		fmt.Println("\nDownloading captions...")
+		cyan.Println("\nDownloading captions...") // nolint
+		log.InfoContext(downloader.ctx(), "downloading captions", slog.Int("count", len(data.Captions)))
 		for k, v := range data.Captions {
 			if v != nil {
-				fmt.Printf("Downloading %s ...\n", k)
+				cyan.Printf("Downloading %s ...\n", k) // nolint
+				log.InfoContext(downloader.ctx(), "downloading caption", slog.String("language", k))
 				if err := downloader.caption(v.URL, title, v.Ext, v.Transform); err != nil {
 					// nolint
 				} else if downloader.option.EmbedSubtitle {
@@ -649,7 +728,10 @@ func (downloader *Downloader) Download(data *extractors.Data) error {
 	}
 	// After the merge, the file size has changed, so we do not check whether the size matches
 	if mergedFileExists {
-		fmt.Printf("%s: file already exists, skipping\n", mergedFilePath)
+		cyan.Printf("%s: file already exists, skipping\n", mergedFilePath) // nolint
+		log.InfoContext(downloader.ctx(), "file already exists, skipping",
+			slog.String("file", mergedFilePath),
+		)
 		return nil
 	}
 
@@ -673,8 +755,9 @@ func (downloader *Downloader) Download(data *extractors.Data) error {
 
 		if downloader.option.EmbedSubtitle && len(subtitlePaths) > 0 {
 			if !downloader.option.Silent {
-				fmt.Println("Embedding subtitles...")
+				cyan.Println("Embedding subtitles...") // nolint
 			}
+			log.InfoContext(downloader.ctx(), "embedding subtitles", slog.Int("count", len(subtitlePaths)))
 			if err := utils.EmbedSubtitles(mergedFilePath, subtitlePaths, subtitleLangs); err != nil {
 				return err
 			}
@@ -733,8 +816,9 @@ func (downloader *Downloader) Download(data *extractors.Data) error {
 	}
 
 	if !downloader.option.Silent {
-		fmt.Printf("Merging video parts into %s\n", mergedFilePath)
+		cyan.Printf("Merging video parts into %s\n", mergedFilePath) // nolint
 	}
+	log.InfoContext(downloader.ctx(), "merging video parts", slog.String("file", mergedFilePath))
 	if stream.Ext != "mp4" || stream.NeedMux {
 		if err := utils.MergeFilesWithSameExtension(parts, mergedFilePath); err != nil {
 			return err
@@ -747,8 +831,9 @@ func (downloader *Downloader) Download(data *extractors.Data) error {
 
 	if downloader.option.EmbedSubtitle && len(subtitlePaths) > 0 {
 		if !downloader.option.Silent {
-			fmt.Println("Embedding subtitles...")
+			cyan.Println("Embedding subtitles...") // nolint
 		}
+		log.InfoContext(downloader.ctx(), "embedding subtitles", slog.Int("count", len(subtitlePaths)))
 		if err := utils.EmbedSubtitles(mergedFilePath, subtitlePaths, subtitleLangs); err != nil {
 			return err
 		}
