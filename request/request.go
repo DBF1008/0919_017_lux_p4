@@ -3,11 +3,13 @@ package request
 import (
 	"compress/flate"
 	"compress/gzip"
+	"context"
 	"crypto/tls"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/cookiejar"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -18,7 +20,11 @@ import (
 	"github.com/pkg/errors"
 
 	"github.com/iawia002/lux/config"
+	"github.com/iawia002/lux/logging"
+	"github.com/iawia002/lux/metrics"
 )
+
+const requestIDHeader = "X-Request-ID"
 
 var (
 	retryTimes int
@@ -49,6 +55,21 @@ func SetOptions(opt Options) {
 
 // Request base request
 func Request(method, url string, body io.Reader, headers map[string]string) (*http.Response, error) {
+	return RequestContext(context.Background(), method, url, body, headers)
+}
+
+// RequestContext is like Request but carries a context used for cancellation
+// and request_id propagation. A unique request id is attached to every call
+// (inherited from ctx when present, otherwise freshly generated) and exposed
+// both in structured logs and via the X-Request-ID request header.
+func RequestContext(ctx context.Context, method, requestURL string, body io.Reader, headers map[string]string) (*http.Response, error) {
+	requestID := logging.RequestIDFromContext(ctx)
+	if requestID == "" {
+		requestID = logging.NewRequestID()
+		ctx = logging.WithRequestID(ctx, requestID)
+	}
+	logger := logging.FromContext(ctx)
+
 	transport := &http.Transport{
 		Proxy:               http.ProxyFromEnvironment,
 		DisableCompression:  true,
@@ -65,7 +86,7 @@ func Request(method, url string, body io.Reader, headers map[string]string) (*ht
 		Jar:       jar,
 	}
 
-	req, err := http.NewRequest(method, url, body)
+	req, err := http.NewRequestWithContext(ctx, method, requestURL, body)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
@@ -76,7 +97,7 @@ func Request(method, url string, body io.Reader, headers map[string]string) (*ht
 		req.Header.Set(k, v)
 	}
 	if _, ok := headers["Referer"]; !ok {
-		req.Header.Set("Referer", url)
+		req.Header.Set("Referer", requestURL)
 	}
 	if rawCookie != "" {
 		// parse cookies in Netscape HTTP cookie format
@@ -99,43 +120,101 @@ func Request(method, url string, body io.Reader, headers map[string]string) (*ht
 	if refer != "" {
 		req.Header.Set("Referer", refer)
 	}
+	req.Header.Set(requestIDHeader, requestID)
 
+	host := hostOf(requestURL)
 	var (
 		res          *http.Response
 		requestError error
 	)
+	startedAt := time.Now()
 	for i := 0; ; i++ {
 		res, requestError = client.Do(req)
 		if requestError == nil && res.StatusCode < 400 {
 			break
-		} else if i+1 >= retryTimes {
-			var err error
-			if requestError != nil {
-				err = errors.Errorf("request error: %v", requestError)
-			} else {
-				err = errors.Errorf("%s request error: HTTP %d", url, res.StatusCode)
-			}
-			return nil, errors.WithStack(err)
 		}
-		time.Sleep(1 * time.Second)
+		if i+1 >= retryTimes {
+			if requestError != nil {
+				metrics.IncHTTPRequest(method, host, 0)
+				logger.Error(
+					"http request failed",
+					"method", method,
+					"url", requestURL,
+					"attempts", i+1,
+					"error", requestError,
+				)
+				return nil, errors.WithStack(errors.Errorf("request error: %v", requestError))
+			}
+			metrics.IncHTTPRequest(method, host, res.StatusCode)
+			logger.Error(
+				"http request failed",
+				"method", method,
+				"url", requestURL,
+				"attempts", i+1,
+				"status_code", res.StatusCode,
+			)
+			return nil, errors.WithStack(errors.Errorf("%s request error: HTTP %d", requestURL, res.StatusCode))
+		}
+		metrics.IncHTTPRetry()
+		if requestError != nil {
+			logger.Warn(
+				"http request retry",
+				"method", method,
+				"url", requestURL,
+				"attempt", i+1,
+				"error", requestError,
+			)
+		} else {
+			logger.Warn(
+				"http request retry",
+				"method", method,
+				"url", requestURL,
+				"attempt", i+1,
+				"status_code", res.StatusCode,
+			)
+		}
+		select {
+		case <-ctx.Done():
+			metrics.IncHTTPRequest(method, host, 0)
+			return nil, errors.WithStack(ctx.Err())
+		case <-time.After(1 * time.Second):
+		}
 	}
+	metrics.IncHTTPRequest(method, host, res.StatusCode)
+	logger.Debug(
+		"http request completed",
+		"method", method,
+		"url", requestURL,
+		"status_code", res.StatusCode,
+		"duration_ms", time.Since(startedAt).Milliseconds(),
+	)
 	if debug {
 		blue := color.New(color.FgBlue)
-		fmt.Println()
-		blue.Printf("URL:         ") // nolint
-		fmt.Printf("%s\n", url)
-		blue.Printf("Method:      ") // nolint
-		fmt.Printf("%s\n", method)
-		blue.Printf("Headers:     ")        // nolint
-		pretty.Printf("%# v\n", req.Header) // nolint
-		blue.Printf("Status Code: ")        // nolint
+		fmt.Fprintln(color.Output)
+		blue.Fprint(color.Output, "URL:         ")
+		fmt.Fprintf(color.Output, "%s\n", requestURL)
+		blue.Fprint(color.Output, "Method:      ")
+		fmt.Fprintf(color.Output, "%s\n", method)
+		blue.Fprint(color.Output, "Request-ID:  ")
+		fmt.Fprintf(color.Output, "%s\n", requestID)
+		blue.Fprint(color.Output, "Headers:     ")
+		pretty.Fprintf(color.Output, "%# v\n", req.Header) // nolint
+		blue.Fprint(color.Output, "Status Code: ")
 		if res.StatusCode >= 400 {
-			color.Red("%d", res.StatusCode)
+			fmt.Fprintf(color.Output, "%s\n", color.RedString("%d", res.StatusCode))
 		} else {
-			color.Green("%d", res.StatusCode)
+			fmt.Fprintf(color.Output, "%s\n", color.GreenString("%d", res.StatusCode))
 		}
 	}
 	return res, nil
+}
+
+func hostOf(rawURL string) string {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return "unknown"
+	}
+	return parsed.Host
 }
 
 // Get get request
